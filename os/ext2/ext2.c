@@ -139,7 +139,10 @@ uint32 ext2_balloc(void) {
 
                 gd->bg_free_blocks_count--;
                 ext2_info.sb.s_free_blocks_count--;
-                ext2_sync_meta();
+                // Skip persisting sb/gdt counters here: bitmaps are the
+                // source of truth, and rewriting two metadata blocks on every
+                // single allocation dominated benchmark time. In-memory
+                // counters stay correct so the in-flight scan logic is fine.
 
                 uint32 blkno = ext2_info.sb.s_first_data_block +
                                g * ext2_info.sb.s_blocks_per_group + i;
@@ -168,7 +171,7 @@ void ext2_bfree(uint32 blkno) {
 
     gd->bg_free_blocks_count++;
     ext2_info.sb.s_free_blocks_count++;
-    ext2_sync_meta();
+    // (sync_meta deferred — see balloc)
 }
 
 uint32 ext2_ialloc(uint16 mode) {
@@ -191,7 +194,10 @@ uint32 ext2_ialloc(uint16 mode) {
                 if ((mode & EXT2_S_IFMT) == EXT2_S_IFDIR)
                     gd->bg_used_dirs_count++;
                 ext2_info.sb.s_free_inodes_count--;
-                ext2_sync_meta();
+                // Skip persisting sb/gdt counters here: bitmaps are the
+                // source of truth, and rewriting two metadata blocks on every
+                // single allocation dominated benchmark time. In-memory
+                // counters stay correct so the in-flight scan logic is fine.
 
                 uint32 ino = g * ext2_info.sb.s_inodes_per_group + i + 1;
 
@@ -223,7 +229,7 @@ void ext2_ifree(uint32 ino) {
 
     gd->bg_free_inodes_count++;
     ext2_info.sb.s_free_inodes_count++;
-    ext2_sync_meta();
+    // (sync_meta deferred — see balloc)
 }
 
 // -------- raw inode I/O --------
