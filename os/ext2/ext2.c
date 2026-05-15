@@ -2,6 +2,15 @@
 #include "ext2_journal.h"
 
 #include "../fs/buf.h"
+#include "timer.h"
+
+// "Current time" expressed as seconds since unix epoch. The kernel doesn't
+// track wall time, so we use seconds-since-boot offset from a fixed epoch
+// base. Adequate for the spec's "timestamps must be updated" requirement.
+#define EXT2_EPOCH_BASE 1779580800u   // approx 2026-05-15
+uint32 ext2_now(void) {
+    return EXT2_EPOCH_BASE + (uint32)(get_cycle() / CPU_FREQ);
+}
 
 // Returns the lowest blkno that balloc must never hand out (journal area).
 // 0xFFFFFFFF if no journal is configured.
@@ -166,7 +175,7 @@ uint32 ext2_balloc_raw(void) {
                 uint32 bit  = i & 7;
                 if (!(bp->data[byte] & (1u << bit))) {
                     bp->data[byte] |= (1u << bit);
-                    bwrite(bp);
+                    ext2_journal_write(bp);
                     brelse(bp);
 
                     gd->bg_free_blocks_count--;
@@ -203,7 +212,7 @@ void ext2_bfree(uint32 blkno) {
     uint32 bit                 = i & 7;
     assert(bp->data[byte] & (1u << bit));
     bp->data[byte] &= ~(1u << bit);
-    bwrite(bp);
+    ext2_journal_write(bp);
     brelse(bp);
 
     gd->bg_free_blocks_count++;
@@ -242,7 +251,7 @@ uint32 ext2_ialloc(uint16 mode) {
                 uint32 bit  = i & 7;
                 if (!(bp->data[byte] & (1u << bit))) {
                     bp->data[byte] |= (1u << bit);
-                    bwrite(bp);
+                    ext2_journal_write(bp);
                     brelse(bp);
 
                     gd->bg_free_inodes_count--;
@@ -256,10 +265,14 @@ uint32 ext2_ialloc(uint16 mode) {
 
                     uint32 ino = g * ext2_info.sb.s_inodes_per_group + i + 1;
 
+                    uint32 now = ext2_now();
                     struct ext2_inode din;
                     memset(&din, 0, sizeof(din));
                     din.i_mode        = mode;
                     din.i_links_count = 1;
+                    din.i_ctime       = now;
+                    din.i_atime       = now;
+                    din.i_mtime       = now;
                     ext2_iwrite_raw(ino, &din);
                     return ino;
                 }
@@ -279,7 +292,7 @@ void ext2_ifree(uint32 ino) {
     uint32 byte                = i >> 3;
     uint32 bit                 = i & 7;
     bp->data[byte] &= ~(1u << bit);
-    bwrite(bp);
+    ext2_journal_write(bp);
     brelse(bp);
 
     gd->bg_free_inodes_count++;

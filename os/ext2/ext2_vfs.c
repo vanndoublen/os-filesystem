@@ -131,6 +131,7 @@ static void ext2_write_inode(struct inode *ind) {
     ext2_iload(ind->ino, &din);
     din.i_size        = ind->size;
     din.i_links_count = ind->nlinks;
+    din.i_mtime       = ext2_now();
     ext2_iwrite_raw(ind->ino, &din);
 }
 
@@ -152,7 +153,7 @@ static void ext2_delete_inode(struct inode *inode) {
     struct ext2_inode din;
     ext2_iload(inode->ino, &din);
     din.i_links_count = 0;
-    din.i_dtime       = 1;  // any non-zero value
+    din.i_dtime       = ext2_now();
     din.i_mode        = 0;
     ext2_iwrite_raw(inode->ino, &din);
 

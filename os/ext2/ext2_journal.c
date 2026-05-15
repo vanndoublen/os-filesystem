@@ -147,15 +147,38 @@ static void journal_replay(void) {
     infof("ext2 journal: replay complete");
 }
 
+// Scan the tail of the filesystem (where journals tend to live) for a block
+// whose first 4 bytes are our JRNL magic. Returns the blkno of an existing
+// journal superblock, or 0 if none is found.
+static uint32 find_existing_journal(void) {
+    uint32 scan_blocks = 256;  // bounded scan to keep mount fast
+    if (scan_blocks > ext2_info.sb.s_blocks_count)
+        scan_blocks = ext2_info.sb.s_blocks_count;
+
+    uint32 start = ext2_info.sb.s_blocks_count - scan_blocks;
+    for (int64 blkno = (int64)ext2_info.sb.s_blocks_count - 1;
+         blkno >= (int64)start; blkno--) {
+        struct buf *bp = bread(0, (uint32)blkno);
+        uint32 magic = *(uint32 *)bp->data;
+        brelse(bp);
+        if (magic == JOURNAL_MAGIC)
+            return (uint32)blkno;
+    }
+    return 0;
+}
+
 void ext2_journal_init(void) {
-    // Find a contiguous free run for the journal area. Scanning from the
-    // end keeps the journal out of the typical "early data block" zone
-    // where mke2fs places the root directory and other initial content.
-    uint32 sb = find_journal_area(JOURNAL_TOTAL_BLOCKS);
+    // Cross-mount persistence: first see if a previous mount already
+    // placed a journal here. Only fall back to a fresh placement when
+    // nothing valid is found.
+    uint32 sb = find_existing_journal();
     if (sb == 0) {
-        infof("ext2 journal: no free run for journal area; disabling");
-        j_initialized = 0;
-        return;
+        sb = find_journal_area(JOURNAL_TOTAL_BLOCKS);
+        if (sb == 0) {
+            infof("ext2 journal: no free run for journal area; disabling");
+            j_initialized = 0;
+            return;
+        }
     }
     journal_sb_blkno  = sb;
     journal_log_start = journal_sb_blkno + 1;

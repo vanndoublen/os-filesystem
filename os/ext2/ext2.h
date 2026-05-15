@@ -168,6 +168,7 @@ int    ext2_iwrite(struct inode *inode, uint32 addr, void *__either buf, loff_t 
 void   ext2_itrunc(struct inode *inode);
 
 imode_t ext2_mode_to_imode(uint16 i_mode);
+uint32  ext2_now(void);  // seconds since (fake) unix epoch
 
 // ext2_vfs.c
 void   ext2_vfs_init(void);
