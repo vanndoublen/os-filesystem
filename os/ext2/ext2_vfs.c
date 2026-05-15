@@ -1,4 +1,5 @@
 #include "ext2.h"
+#include "ext2_journal.h"
 
 #include "../fs/buf.h"
 
@@ -74,6 +75,7 @@ void ext2_vfs_init(void) {
     infof("ext2_vfs_init: ext2 vfs init");
 
     ext2_init();
+    ext2_journal_init();
 
     ext2_sb_vfs.name    = "ext2";
     ext2_sb_vfs.ops     = &ext2_sb_ops;
