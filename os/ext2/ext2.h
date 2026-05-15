@@ -153,7 +153,8 @@ void   ext2_init(void);
 void   ext2_sync_super(void);
 void   ext2_sync_gdt(void);
 
-uint32 ext2_balloc(void);
+uint32 ext2_balloc(void);      // returns a zeroed block (use for indirect blocks)
+uint32 ext2_balloc_raw(void);  // returns a block with undefined contents
 void   ext2_bfree(uint32 blkno);
 uint32 ext2_ialloc(uint16 mode);
 void   ext2_ifree(uint32 ino);

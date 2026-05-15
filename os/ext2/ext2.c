@@ -126,7 +126,10 @@ static void ext2_bzero(uint32 blkno) {
 static uint32 balloc_hint_grp = 0;
 static uint32 balloc_hint_idx = 0;
 
-uint32 ext2_balloc(void) {
+// Allocate a block from the bitmap but do NOT zero its contents. The caller
+// is responsible for either fully overwriting it or zeroing what it needs.
+// Used for leaf data blocks where iwrite will immediately overwrite.
+uint32 ext2_balloc_raw(void) {
     uint32 max_bits = ext2_info.sb.s_blocks_per_group;
 
     for (uint32 step = 0; step < ext2_info.num_groups; step++) {
@@ -163,7 +166,6 @@ uint32 ext2_balloc(void) {
 
                     uint32 blkno = ext2_info.sb.s_first_data_block +
                                    g * max_bits + i;
-                    ext2_bzero(blkno);
                     return blkno;
                 }
             }
@@ -171,6 +173,15 @@ uint32 ext2_balloc(void) {
         brelse(bp);
     }
     return 0;
+}
+
+// Allocate a block and zero it. Used for indirect blocks, where the pointer
+// array must contain zeros so unallocated entries are detectable.
+uint32 ext2_balloc(void) {
+    uint32 blkno = ext2_balloc_raw();
+    if (blkno != 0)
+        ext2_bzero(blkno);
+    return blkno;
 }
 
 void ext2_bfree(uint32 blkno) {
@@ -293,8 +304,14 @@ void ext2_iwrite_raw(uint32 ino, const struct ext2_inode *in) {
 // Same as ext2_iaddr but uses the caller-provided on-disk inode buffer and
 // `dirty` flag. Lets callers hold the inode struct across many iaddr calls
 // and persist it once at the end instead of per-iteration.
+//
+// `just_alloc` (optional out-param) is set to 1 iff the returned leaf data
+// block was freshly allocated by this call. Callers writing partial blocks
+// must then zero the buffer themselves, since the leaf block is not zeroed
+// by balloc_raw.
 static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
-                             int *dirtyp, uint32 addr, uint32 *oblkno) {
+                             int *dirtyp, uint32 addr, uint32 *oblkno,
+                             int *just_alloc) {
     assert(holdingsleep(&inode->lock));
 
     uint32 P   = ext2_info.ptrs_per_block;
@@ -303,13 +320,15 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
     struct ext2_inode din = *dinp;
     int dirty = 0;
     int ret   = 0;
+    int leaf_alloc = 0;
 
     if (lbn < EXT2_NDIR_BLOCKS) {
         if (din.i_block[lbn] == 0) {
-            uint32 b = ext2_balloc();
+            uint32 b = ext2_balloc_raw();
             if (b == 0) { ret = -ENOSPC; goto done; }
             din.i_block[lbn] = b;
             dirty = 1;
+            leaf_alloc = 1;
         }
         *oblkno = din.i_block[lbn];
         goto done;
@@ -326,10 +345,11 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp = bread(0, din.i_block[EXT2_IND_BLOCK]);
         uint32 *tbl    = (uint32 *)bp->data;
         if (tbl[lbn] == 0) {
-            uint32 b = ext2_balloc();
+            uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp); ret = -ENOSPC; goto done; }
             tbl[lbn] = b;
             bwrite(bp);
+            leaf_alloc = 1;
         }
         *oblkno = tbl[lbn];
         brelse(bp);
@@ -357,10 +377,11 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp2 = bread(0, t1[i1]);
         uint32 *t2      = (uint32 *)bp2->data;
         if (t2[i2] == 0) {
-            uint32 b = ext2_balloc();
+            uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp1); brelse(bp2); ret = -ENOSPC; goto done; }
             t2[i2] = b;
             bwrite(bp2);
+            leaf_alloc = 1;
         }
         *oblkno = t2[i2];
         brelse(bp1);
@@ -398,10 +419,11 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp3 = bread(0, t2[i2]);
         uint32 *t3      = (uint32 *)bp3->data;
         if (t3[i3] == 0) {
-            uint32 b = ext2_balloc();
+            uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp1); brelse(bp2); brelse(bp3); ret = -ENOSPC; goto done; }
             t3[i3] = b;
             bwrite(bp3);
+            leaf_alloc = 1;
         }
         *oblkno = t3[i3];
         brelse(bp1);
@@ -417,6 +439,8 @@ done:
         *dinp = din;
         *dirtyp = 1;
     }
+    if (just_alloc)
+        *just_alloc = leaf_alloc;
     return ret;
 }
 
@@ -425,7 +449,7 @@ int ext2_iaddr(struct inode *inode, uint32 addr, uint32 *oblkno) {
     struct ext2_inode din;
     ext2_iload(inode->ino, &din);
     int dirty = 0;
-    int ret = ext2_iaddr_cached(inode, &din, &dirty, addr, oblkno);
+    int ret = ext2_iaddr_cached(inode, &din, &dirty, addr, oblkno, NULL);
     if (dirty)
         ext2_iwrite_raw(inode->ino, &din);
     return ret;
@@ -447,11 +471,14 @@ int ext2_iread(struct inode *inode, uint32 addr, void *__either buf, loff_t len)
 
     while (pos < end) {
         uint32 blkno;
-        int ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno);
+        int just_alloc = 0;
+        int ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno, &just_alloc);
         if (ret < 0)
             return ret;
 
         struct buf *bp = bread(0, blkno);
+        if (just_alloc)  // freshly-allocated leaf may hold stale disk bytes
+            memset(bp->data, 0, ext2_info.block_size);
         uint32 off     = pos % ext2_info.block_size;
         uint32 todo    = MIN(end - pos, ext2_info.block_size - off);
         vfs_either_copy_out(buf, bp->data + off, todo);
@@ -490,13 +517,19 @@ int ext2_iwrite(struct inode *inode, uint32 addr, void *__either buf, loff_t len
 
     while (pos < end) {
         uint32 blkno;
-        ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno);
+        int just_alloc = 0;
+        ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno, &just_alloc);
         if (ret < 0)
             goto out;
 
         struct buf *bp = bread(0, blkno);
         uint32 off     = pos % ext2_info.block_size;
         uint32 todo    = MIN(end - pos, ext2_info.block_size - off);
+        // If the leaf block is freshly allocated and we're only writing
+        // part of it, zero the rest so we don't leak stale disk content
+        // into the file.
+        if (just_alloc && !(off == 0 && todo == ext2_info.block_size))
+            memset(bp->data, 0, ext2_info.block_size);
         vfs_either_copy_in(buf, bp->data + off, todo);
         bwrite(bp);
         brelse(bp);
