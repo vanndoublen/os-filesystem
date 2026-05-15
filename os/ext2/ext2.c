@@ -121,33 +121,51 @@ static void ext2_bzero(uint32 blkno) {
     brelse(bp);
 }
 
+// Resume-scan hints so allocators don't rescan the bitmap from bit 0 each call.
+// Stale values are harmless: they just cause an extra wrap-around.
+static uint32 balloc_hint_grp = 0;
+static uint32 balloc_hint_idx = 0;
+
 uint32 ext2_balloc(void) {
-    for (uint32 g = 0; g < ext2_info.num_groups; g++) {
+    uint32 max_bits = ext2_info.sb.s_blocks_per_group;
+
+    for (uint32 step = 0; step < ext2_info.num_groups; step++) {
+        uint32 g = (balloc_hint_grp + step) % ext2_info.num_groups;
         struct ext2_group_desc *gd = &ext2_info.gdt[g];
         if (gd->bg_free_blocks_count == 0)
             continue;
 
-        struct buf *bp   = bread(0, gd->bg_block_bitmap);
-        uint32 max_bits  = ext2_info.sb.s_blocks_per_group;
-        for (uint32 i = 0; i < max_bits; i++) {
-            uint32 byte = i >> 3;
-            uint32 bit  = i & 7;
-            if (!(bp->data[byte] & (1u << bit))) {
-                bp->data[byte] |= (1u << bit);
-                bwrite(bp);
-                brelse(bp);
+        struct buf *bp = bread(0, gd->bg_block_bitmap);
 
-                gd->bg_free_blocks_count--;
-                ext2_info.sb.s_free_blocks_count--;
-                // Skip persisting sb/gdt counters here: bitmaps are the
-                // source of truth, and rewriting two metadata blocks on every
-                // single allocation dominated benchmark time. In-memory
-                // counters stay correct so the in-flight scan logic is fine.
+        // For the starting group, begin where we left off; for the rest, scan
+        // from the start. Each group gets up to two passes (hint..end, then
+        // 0..hint) so we don't miss bits we already walked past.
+        uint32 start = (step == 0) ? balloc_hint_idx : 0;
+        if (start >= max_bits) start = 0;
 
-                uint32 blkno = ext2_info.sb.s_first_data_block +
-                               g * ext2_info.sb.s_blocks_per_group + i;
-                ext2_bzero(blkno);
-                return blkno;
+        for (uint32 pass = 0; pass < 2; pass++) {
+            uint32 lo = (pass == 0) ? start : 0;
+            uint32 hi = (pass == 0) ? max_bits : start;
+            for (uint32 i = lo; i < hi; i++) {
+                uint32 byte = i >> 3;
+                uint32 bit  = i & 7;
+                if (!(bp->data[byte] & (1u << bit))) {
+                    bp->data[byte] |= (1u << bit);
+                    bwrite(bp);
+                    brelse(bp);
+
+                    gd->bg_free_blocks_count--;
+                    ext2_info.sb.s_free_blocks_count--;
+                    // (sb/gdt counter sync deferred — bitmaps are the truth)
+
+                    balloc_hint_grp = g;
+                    balloc_hint_idx = i + 1;
+
+                    uint32 blkno = ext2_info.sb.s_first_data_block +
+                                   g * max_bits + i;
+                    ext2_bzero(blkno);
+                    return blkno;
+                }
             }
         }
         brelse(bp);
@@ -172,42 +190,60 @@ void ext2_bfree(uint32 blkno) {
     gd->bg_free_blocks_count++;
     ext2_info.sb.s_free_blocks_count++;
     // (sync_meta deferred — see balloc)
+
+    // Rewind the allocation hint so the freed slot is found quickly.
+    if (g < balloc_hint_grp || (g == balloc_hint_grp && i < balloc_hint_idx)) {
+        balloc_hint_grp = g;
+        balloc_hint_idx = i;
+    }
 }
 
+static uint32 ialloc_hint_grp = 0;
+static uint32 ialloc_hint_idx = 0;
+
 uint32 ext2_ialloc(uint16 mode) {
-    for (uint32 g = 0; g < ext2_info.num_groups; g++) {
+    uint32 max_bits = ext2_info.sb.s_inodes_per_group;
+
+    for (uint32 step = 0; step < ext2_info.num_groups; step++) {
+        uint32 g = (ialloc_hint_grp + step) % ext2_info.num_groups;
         struct ext2_group_desc *gd = &ext2_info.gdt[g];
         if (gd->bg_free_inodes_count == 0)
             continue;
 
-        struct buf *bp  = bread(0, gd->bg_inode_bitmap);
-        uint32 max_bits = ext2_info.sb.s_inodes_per_group;
-        for (uint32 i = 0; i < max_bits; i++) {
-            uint32 byte = i >> 3;
-            uint32 bit  = i & 7;
-            if (!(bp->data[byte] & (1u << bit))) {
-                bp->data[byte] |= (1u << bit);
-                bwrite(bp);
-                brelse(bp);
+        struct buf *bp = bread(0, gd->bg_inode_bitmap);
 
-                gd->bg_free_inodes_count--;
-                if ((mode & EXT2_S_IFMT) == EXT2_S_IFDIR)
-                    gd->bg_used_dirs_count++;
-                ext2_info.sb.s_free_inodes_count--;
-                // Skip persisting sb/gdt counters here: bitmaps are the
-                // source of truth, and rewriting two metadata blocks on every
-                // single allocation dominated benchmark time. In-memory
-                // counters stay correct so the in-flight scan logic is fine.
+        uint32 start = (step == 0) ? ialloc_hint_idx : 0;
+        if (start >= max_bits) start = 0;
 
-                uint32 ino = g * ext2_info.sb.s_inodes_per_group + i + 1;
+        for (uint32 pass = 0; pass < 2; pass++) {
+            uint32 lo = (pass == 0) ? start : 0;
+            uint32 hi = (pass == 0) ? max_bits : start;
+            for (uint32 i = lo; i < hi; i++) {
+                uint32 byte = i >> 3;
+                uint32 bit  = i & 7;
+                if (!(bp->data[byte] & (1u << bit))) {
+                    bp->data[byte] |= (1u << bit);
+                    bwrite(bp);
+                    brelse(bp);
 
-                // Initialize the on-disk inode.
-                struct ext2_inode din;
-                memset(&din, 0, sizeof(din));
-                din.i_mode        = mode;
-                din.i_links_count = 1;
-                ext2_iwrite_raw(ino, &din);
-                return ino;
+                    gd->bg_free_inodes_count--;
+                    if ((mode & EXT2_S_IFMT) == EXT2_S_IFDIR)
+                        gd->bg_used_dirs_count++;
+                    ext2_info.sb.s_free_inodes_count--;
+                    // (sb/gdt counter sync deferred — bitmaps are the truth)
+
+                    ialloc_hint_grp = g;
+                    ialloc_hint_idx = i + 1;
+
+                    uint32 ino = g * ext2_info.sb.s_inodes_per_group + i + 1;
+
+                    struct ext2_inode din;
+                    memset(&din, 0, sizeof(din));
+                    din.i_mode        = mode;
+                    din.i_links_count = 1;
+                    ext2_iwrite_raw(ino, &din);
+                    return ino;
+                }
             }
         }
         brelse(bp);
@@ -230,6 +266,11 @@ void ext2_ifree(uint32 ino) {
     gd->bg_free_inodes_count++;
     ext2_info.sb.s_free_inodes_count++;
     // (sync_meta deferred — see balloc)
+
+    if (g < ialloc_hint_grp || (g == ialloc_hint_grp && i < ialloc_hint_idx)) {
+        ialloc_hint_grp = g;
+        ialloc_hint_idx = i;
+    }
 }
 
 // -------- raw inode I/O --------
@@ -249,16 +290,17 @@ void ext2_iwrite_raw(uint32 ino, const struct ext2_inode *in) {
 
 // -------- block addressing (with allocation) --------
 
-// Translate the logical byte offset `addr` of an inode's file content to a
-// physical block number, allocating direct and indirect blocks as needed.
-int ext2_iaddr(struct inode *inode, uint32 addr, uint32 *oblkno) {
+// Same as ext2_iaddr but uses the caller-provided on-disk inode buffer and
+// `dirty` flag. Lets callers hold the inode struct across many iaddr calls
+// and persist it once at the end instead of per-iteration.
+static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
+                             int *dirtyp, uint32 addr, uint32 *oblkno) {
     assert(holdingsleep(&inode->lock));
 
     uint32 P   = ext2_info.ptrs_per_block;
     uint32 lbn = addr / ext2_info.block_size;
 
-    struct ext2_inode din;
-    ext2_iload(inode->ino, &din);
+    struct ext2_inode din = *dinp;
     int dirty = 0;
     int ret   = 0;
 
@@ -371,6 +413,19 @@ int ext2_iaddr(struct inode *inode, uint32 addr, uint32 *oblkno) {
     ret = -EFBIG;
 
 done:
+    if (dirty) {
+        *dinp = din;
+        *dirtyp = 1;
+    }
+    return ret;
+}
+
+// Thin wrapper for callers that don't want to manage the inode buffer.
+int ext2_iaddr(struct inode *inode, uint32 addr, uint32 *oblkno) {
+    struct ext2_inode din;
+    ext2_iload(inode->ino, &din);
+    int dirty = 0;
+    int ret = ext2_iaddr_cached(inode, &din, &dirty, addr, oblkno);
     if (dirty)
         ext2_iwrite_raw(inode->ino, &din);
     return ret;
@@ -383,12 +438,16 @@ int ext2_iread(struct inode *inode, uint32 addr, void *__either buf, loff_t len)
     if (addr >= inode->size)
         return 0;
 
+    struct ext2_inode din;
+    ext2_iload(inode->ino, &din);
+    int dirty = 0;
+
     loff_t pos = addr;
     loff_t end = MIN(addr + len, inode->size);
 
     while (pos < end) {
         uint32 blkno;
-        int ret = ext2_iaddr(inode, pos, &blkno);
+        int ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno);
         if (ret < 0)
             return ret;
 
@@ -401,6 +460,11 @@ int ext2_iread(struct inode *inode, uint32 addr, void *__either buf, loff_t len)
         pos += todo;
         buf  = (void *)((uint64)buf + todo);
     }
+
+    // Reads shouldn't modify the inode, but if a sparse hole forced an alloc
+    // we persist the change rather than lose it.
+    if (dirty)
+        ext2_iwrite_raw(inode->ino, &din);
     return pos - addr;
 }
 
@@ -414,13 +478,19 @@ int ext2_iwrite(struct inode *inode, uint32 addr, void *__either buf, loff_t len
     if (addr >= maxbytes)
         return -EFBIG;
 
+    // Load the on-disk inode once. Every iaddr inside the loop updates this
+    // buffer locally; we persist a single time after the loop.
+    struct ext2_inode din;
+    ext2_iload(inode->ino, &din);
+    int dirty = 0;
+
     int ret = 0;
     loff_t pos = addr;
     loff_t end = MIN((uint64)(addr + len), maxbytes);
 
     while (pos < end) {
         uint32 blkno;
-        ret = ext2_iaddr(inode, pos, &blkno);
+        ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno);
         if (ret < 0)
             goto out;
 
@@ -437,14 +507,14 @@ int ext2_iwrite(struct inode *inode, uint32 addr, void *__either buf, loff_t len
 
 out:
     if (pos > inode->size) {
-        inode->size = pos;
-        // Persist the new size and block count.
-        struct ext2_inode din;
-        ext2_iload(inode->ino, &din);
-        din.i_size   = inode->size;
-        din.i_blocks = (inode->size + 511) / 512;
-        ext2_iwrite_raw(inode->ino, &din);
+        inode->size  = pos;
+        din.i_size   = pos;
+        din.i_blocks = (pos + 511) / 512;
+        dirty = 1;
     }
+
+    if (dirty)
+        ext2_iwrite_raw(inode->ino, &din);
 
     if (pos == addr && ret < 0)
         return ret;
