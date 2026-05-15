@@ -1,6 +1,13 @@
 #include "ext2.h"
+#include "ext2_journal.h"
 
 #include "../fs/buf.h"
+
+// Returns the lowest blkno that balloc must never hand out (journal area).
+// 0xFFFFFFFF if no journal is configured.
+static inline uint32 alloc_upper_bound(void) {
+    return ext2_journal_first_reserved_block();
+}
 
 struct ext2_fs_info ext2_info;
 
@@ -131,6 +138,7 @@ static uint32 balloc_hint_idx = 0;
 // Used for leaf data blocks where iwrite will immediately overwrite.
 uint32 ext2_balloc_raw(void) {
     uint32 max_bits = ext2_info.sb.s_blocks_per_group;
+    uint32 reserved_from = alloc_upper_bound();  // journal-area floor
 
     for (uint32 step = 0; step < ext2_info.num_groups; step++) {
         uint32 g = (balloc_hint_grp + step) % ext2_info.num_groups;
@@ -140,9 +148,6 @@ uint32 ext2_balloc_raw(void) {
 
         struct buf *bp = bread(0, gd->bg_block_bitmap);
 
-        // For the starting group, begin where we left off; for the rest, scan
-        // from the start. Each group gets up to two passes (hint..end, then
-        // 0..hint) so we don't miss bits we already walked past.
         uint32 start = (step == 0) ? balloc_hint_idx : 0;
         if (start >= max_bits) start = 0;
 
@@ -150,6 +155,13 @@ uint32 ext2_balloc_raw(void) {
             uint32 lo = (pass == 0) ? start : 0;
             uint32 hi = (pass == 0) ? max_bits : start;
             for (uint32 i = lo; i < hi; i++) {
+                uint32 blkno = ext2_info.sb.s_first_data_block +
+                               g * max_bits + i;
+                // Hard cap: never hand out a block that's inside the
+                // reserved journal area, regardless of bitmap state.
+                if (blkno >= reserved_from)
+                    continue;
+
                 uint32 byte = i >> 3;
                 uint32 bit  = i & 7;
                 if (!(bp->data[byte] & (1u << bit))) {
@@ -159,13 +171,9 @@ uint32 ext2_balloc_raw(void) {
 
                     gd->bg_free_blocks_count--;
                     ext2_info.sb.s_free_blocks_count--;
-                    // (sb/gdt counter sync deferred — bitmaps are the truth)
 
                     balloc_hint_grp = g;
                     balloc_hint_idx = i + 1;
-
-                    uint32 blkno = ext2_info.sb.s_first_data_block +
-                                   g * max_bits + i;
                     return blkno;
                 }
             }
@@ -295,7 +303,7 @@ void ext2_iload(uint32 ino, struct ext2_inode *out) {
 void ext2_iwrite_raw(uint32 ino, const struct ext2_inode *in) {
     struct buf *bp = bread(0, ext2_inode_block(ino));
     memmove(bp->data + ext2_inode_offset(ino), in, sizeof(struct ext2_inode));
-    bwrite(bp);
+    ext2_journal_write(bp);
     brelse(bp);
 }
 
@@ -348,7 +356,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
             uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp); ret = -ENOSPC; goto done; }
             tbl[lbn] = b;
-            bwrite(bp);
+            ext2_journal_write(bp);
             leaf_alloc = 1;
         }
         *oblkno = tbl[lbn];
@@ -372,7 +380,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
             uint32 b = ext2_balloc();
             if (b == 0) { brelse(bp1); ret = -ENOSPC; goto done; }
             t1[i1] = b;
-            bwrite(bp1);
+            ext2_journal_write(bp1);
         }
         struct buf *bp2 = bread(0, t1[i1]);
         uint32 *t2      = (uint32 *)bp2->data;
@@ -380,7 +388,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
             uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp1); brelse(bp2); ret = -ENOSPC; goto done; }
             t2[i2] = b;
-            bwrite(bp2);
+            ext2_journal_write(bp2);
             leaf_alloc = 1;
         }
         *oblkno = t2[i2];
@@ -406,7 +414,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
             uint32 b = ext2_balloc();
             if (b == 0) { brelse(bp1); ret = -ENOSPC; goto done; }
             t1[i1] = b;
-            bwrite(bp1);
+            ext2_journal_write(bp1);
         }
         struct buf *bp2 = bread(0, t1[i1]);
         uint32 *t2      = (uint32 *)bp2->data;
@@ -414,7 +422,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
             uint32 b = ext2_balloc();
             if (b == 0) { brelse(bp1); brelse(bp2); ret = -ENOSPC; goto done; }
             t2[i2] = b;
-            bwrite(bp2);
+            ext2_journal_write(bp2);
         }
         struct buf *bp3 = bread(0, t2[i2]);
         uint32 *t3      = (uint32 *)bp3->data;
@@ -422,7 +430,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
             uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp1); brelse(bp2); brelse(bp3); ret = -ENOSPC; goto done; }
             t3[i3] = b;
-            bwrite(bp3);
+            ext2_journal_write(bp3);
             leaf_alloc = 1;
         }
         *oblkno = t3[i3];

@@ -245,7 +245,7 @@ static int ext2_dir_add(struct inode *parent, const char *name, uint32 ino,
                 de->name_len  = name_len;
                 de->file_type = file_type;
                 memmove(de->name, name, name_len);
-                bwrite(bp);
+                ext2_journal_write(bp);
                 brelse(bp);
                 return 0;
             }
@@ -263,7 +263,7 @@ static int ext2_dir_add(struct inode *parent, const char *name, uint32 ino,
                 nde->file_type = file_type;
                 memmove(nde->name, name, name_len);
 
-                bwrite(bp);
+                ext2_journal_write(bp);
                 brelse(bp);
                 return 0;
             }
@@ -291,7 +291,7 @@ static int ext2_dir_add(struct inode *parent, const char *name, uint32 ino,
     de->name_len  = name_len;
     de->file_type = file_type;
     memmove(de->name, name, name_len);
-    bwrite(bp);
+    ext2_journal_write(bp);
     brelse(bp);
 
     parent->size += ext2_info.block_size;
@@ -334,7 +334,7 @@ static int ext2_dir_remove(struct inode *parent, const char *name,
                 } else {
                     de->inode = 0;
                 }
-                bwrite(bp);
+                ext2_journal_write(bp);
                 brelse(bp);
                 return 0;
             }
@@ -413,16 +413,22 @@ static int ext2_create_common(struct inode *parent, struct dentry *dentry,
 }
 
 static int ext2_create(struct inode *parent, struct dentry *dentry) {
-    return ext2_create_common(parent, dentry, EXT2_S_IFREG | 0644,
-                              EXT2_FT_REG_FILE);
+    ext2_journal_begin();
+    int ret = ext2_create_common(parent, dentry, EXT2_S_IFREG | 0644,
+                                 EXT2_FT_REG_FILE);
+    ext2_journal_commit();
+    return ret;
 }
 
 static int ext2_mkfifo(struct inode *parent, struct dentry *dentry) {
-    return ext2_create_common(parent, dentry, EXT2_S_IFIFO | 0644,
-                              EXT2_FT_FIFO);
+    ext2_journal_begin();
+    int ret = ext2_create_common(parent, dentry, EXT2_S_IFIFO | 0644,
+                                 EXT2_FT_FIFO);
+    ext2_journal_commit();
+    return ret;
 }
 
-static int ext2_mkdir(struct inode *parent, struct dentry *dentry) {
+static int ext2_mkdir_inner(struct inode *parent, struct dentry *dentry) {
     uint32 ino = ext2_ialloc(EXT2_S_IFDIR | 0755);
     if (ino == 0)
         return -ENOSPC;
@@ -466,7 +472,7 @@ static int ext2_mkdir(struct inode *parent, struct dentry *dentry) {
     dotdot->name[0]   = '.';
     dotdot->name[1]   = '.';
 
-    bwrite(bp);
+    ext2_journal_write(bp);
     brelse(bp);
 
     new_dir->size   = ext2_info.block_size;
@@ -490,7 +496,14 @@ static int ext2_mkdir(struct inode *parent, struct dentry *dentry) {
     return 0;
 }
 
-static int ext2_unlink(struct inode *parent, struct dentry *dentry) {
+static int ext2_mkdir(struct inode *parent, struct dentry *dentry) {
+    ext2_journal_begin();
+    int ret = ext2_mkdir_inner(parent, dentry);
+    ext2_journal_commit();
+    return ret;
+}
+
+static int ext2_unlink_inner(struct inode *parent, struct dentry *dentry) {
     // Note: by the time we get here, VFS has already iunlockput(dentry->ind),
     // so that pointer is dangling. Use the name to remove the parent entry
     // and ext2_iget to re-acquire a clean handle for the child.
@@ -508,7 +521,14 @@ static int ext2_unlink(struct inode *parent, struct dentry *dentry) {
     return 0;
 }
 
-static int ext2_rmdir(struct inode *parent, struct dentry *dentry) {
+static int ext2_unlink(struct inode *parent, struct dentry *dentry) {
+    ext2_journal_begin();
+    int ret = ext2_unlink_inner(parent, dentry);
+    ext2_journal_commit();
+    return ret;
+}
+
+static int ext2_rmdir_inner(struct inode *parent, struct dentry *dentry) {
     // dentry->ind is ref-held but unlocked here. Re-acquire via ext2_iget so
     // we can safely walk the directory contents and update fields.
     struct inode *child = ext2_iget(parent->sb, dentry->ind->ino);
@@ -543,6 +563,13 @@ static int ext2_rmdir(struct inode *parent, struct dentry *dentry) {
     return 0;
 }
 
+static int ext2_rmdir(struct inode *parent, struct dentry *dentry) {
+    ext2_journal_begin();
+    int ret = ext2_rmdir_inner(parent, dentry);
+    ext2_journal_commit();
+    return ret;
+}
+
 // -------- file_operations --------
 
 static int ext2_file_read(struct file *file, void *__either buf, loff_t len) {
@@ -567,7 +594,9 @@ static int ext2_file_write(struct file *file, void *__either buf, loff_t len) {
         return -EINVAL;
 
     ilock(ind);
+    ext2_journal_begin();
     int ret = ext2_iwrite(ind, file->pos, buf, len);
+    ext2_journal_commit();
     iunlock(ind);
     if (ret < 0)
         return ret;

@@ -48,9 +48,15 @@ static_assert(sizeof(struct journal_txn_header) == 4096);
 #define JOURNAL_COMMIT_MARKER  0xC0FFEEu
 
 // API
+struct buf;
 void ext2_journal_init(void);
 void ext2_journal_begin(void);
-void ext2_journal_log(uint32 blkno, void *data);
+// Drop-in replacement for bwrite() on metadata blocks. When a txn is active,
+// the (blkno, data) pair is staged for the journal log AND the block is
+// applied to disk immediately (so subsequent reads see the new state even
+// with our buffer cache). When no txn is active, behaves exactly like
+// bwrite() — safe to use from contexts that haven't called begin/commit.
+void ext2_journal_write(struct buf *bp);
 void ext2_journal_commit(void);
 
 // First reserved-by-journal block number (used by balloc to skip).

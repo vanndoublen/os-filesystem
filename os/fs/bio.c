@@ -75,7 +75,7 @@ static struct buf *bget(uint dev, uint blockno) {
     acquire(&bcache.lock);
 
     // Is the block already cached?
-    for (b = bcache.head; b != bcache.head; b = b->next) {
+    for (b = bcache.head->next; b != bcache.head; b = b->next) {
         if (b->dev == dev && b->blockno == blockno) {
             b->refcnt++;
             release(&bcache.lock);
