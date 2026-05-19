@@ -332,7 +332,7 @@ void ext2_iwrite_raw(uint32 ino, const struct ext2_inode *in) {
 // by balloc_raw.
 static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
                              int *dirtyp, uint32 addr, uint32 *oblkno,
-                             int *just_alloc) {
+                             int allocate, int *just_alloc) {
     assert(holdingsleep(&inode->lock));
 
     uint32 P   = ext2_info.ptrs_per_block;
@@ -345,6 +345,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
 
     if (lbn < EXT2_NDIR_BLOCKS) {
         if (din.i_block[lbn] == 0) {
+            if (!allocate) { *oblkno = 0; goto done; }
             uint32 b = ext2_balloc_raw();
             if (b == 0) { ret = -ENOSPC; goto done; }
             din.i_block[lbn] = b;
@@ -358,6 +359,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
     lbn -= EXT2_NDIR_BLOCKS;
     if (lbn < P) {
         if (din.i_block[EXT2_IND_BLOCK] == 0) {
+            if (!allocate) { *oblkno = 0; goto done; }
             uint32 b = ext2_balloc();
             if (b == 0) { ret = -ENOSPC; goto done; }
             din.i_block[EXT2_IND_BLOCK] = b;
@@ -366,6 +368,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp = bread(0, din.i_block[EXT2_IND_BLOCK]);
         uint32 *tbl    = (uint32 *)bp->data;
         if (tbl[lbn] == 0) {
+            if (!allocate) { *oblkno = 0; brelse(bp); goto done; }
             uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp); ret = -ENOSPC; goto done; }
             tbl[lbn] = b;
@@ -380,6 +383,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
     lbn -= P;
     if (lbn < P * P) {
         if (din.i_block[EXT2_DIND_BLOCK] == 0) {
+            if (!allocate) { *oblkno = 0; goto done; }
             uint32 b = ext2_balloc();
             if (b == 0) { ret = -ENOSPC; goto done; }
             din.i_block[EXT2_DIND_BLOCK] = b;
@@ -390,6 +394,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp1 = bread(0, din.i_block[EXT2_DIND_BLOCK]);
         uint32 *t1      = (uint32 *)bp1->data;
         if (t1[i1] == 0) {
+            if (!allocate) { *oblkno = 0; brelse(bp1); goto done; }
             uint32 b = ext2_balloc();
             if (b == 0) { brelse(bp1); ret = -ENOSPC; goto done; }
             t1[i1] = b;
@@ -398,6 +403,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp2 = bread(0, t1[i1]);
         uint32 *t2      = (uint32 *)bp2->data;
         if (t2[i2] == 0) {
+            if (!allocate) { *oblkno = 0; brelse(bp1); brelse(bp2); goto done; }
             uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp1); brelse(bp2); ret = -ENOSPC; goto done; }
             t2[i2] = b;
@@ -413,6 +419,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
     lbn -= P * P;
     if (lbn < P * P * P) {
         if (din.i_block[EXT2_TIND_BLOCK] == 0) {
+            if (!allocate) { *oblkno = 0; goto done; }
             uint32 b = ext2_balloc();
             if (b == 0) { ret = -ENOSPC; goto done; }
             din.i_block[EXT2_TIND_BLOCK] = b;
@@ -424,6 +431,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp1 = bread(0, din.i_block[EXT2_TIND_BLOCK]);
         uint32 *t1      = (uint32 *)bp1->data;
         if (t1[i1] == 0) {
+            if (!allocate) { *oblkno = 0; brelse(bp1); goto done; }
             uint32 b = ext2_balloc();
             if (b == 0) { brelse(bp1); ret = -ENOSPC; goto done; }
             t1[i1] = b;
@@ -432,6 +440,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp2 = bread(0, t1[i1]);
         uint32 *t2      = (uint32 *)bp2->data;
         if (t2[i2] == 0) {
+            if (!allocate) { *oblkno = 0; brelse(bp1); brelse(bp2); goto done; }
             uint32 b = ext2_balloc();
             if (b == 0) { brelse(bp1); brelse(bp2); ret = -ENOSPC; goto done; }
             t2[i2] = b;
@@ -440,6 +449,7 @@ static int ext2_iaddr_cached(struct inode *inode, struct ext2_inode *dinp,
         struct buf *bp3 = bread(0, t2[i2]);
         uint32 *t3      = (uint32 *)bp3->data;
         if (t3[i3] == 0) {
+            if (!allocate) { *oblkno = 0; brelse(bp1); brelse(bp2); brelse(bp3); goto done; }
             uint32 b = ext2_balloc_raw();
             if (b == 0) { brelse(bp1); brelse(bp2); brelse(bp3); ret = -ENOSPC; goto done; }
             t3[i3] = b;
@@ -466,17 +476,22 @@ done:
 }
 
 // Thin wrapper for callers that don't want to manage the inode buffer.
+// Always allocates on miss (the common path for writes / extending).
 int ext2_iaddr(struct inode *inode, uint32 addr, uint32 *oblkno) {
     struct ext2_inode din;
     ext2_iload(inode->ino, &din);
     int dirty = 0;
-    int ret = ext2_iaddr_cached(inode, &din, &dirty, addr, oblkno, NULL);
+    int ret = ext2_iaddr_cached(inode, &din, &dirty, addr, oblkno,
+                                /*allocate=*/1, NULL);
     if (dirty)
         ext2_iwrite_raw(inode->ino, &din);
     return ret;
 }
 
 // -------- file I/O --------
+
+// Static zero source used for filling sparse holes during reads.
+static const char ext2_zero_block[BSIZE];
 
 int ext2_iread(struct inode *inode, uint32 addr, void *__either buf, loff_t len) {
     assert(holdingsleep(&inode->lock));
@@ -492,25 +507,31 @@ int ext2_iread(struct inode *inode, uint32 addr, void *__either buf, loff_t len)
 
     while (pos < end) {
         uint32 blkno;
-        int just_alloc = 0;
-        int ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno, &just_alloc);
+        // Read path: don't allocate on miss — holes inside file size must
+        // return zeros without materializing the block on disk.
+        int ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno,
+                                    /*allocate=*/0, NULL);
         if (ret < 0)
             return ret;
 
-        struct buf *bp = bread(0, blkno);
-        if (just_alloc)  // freshly-allocated leaf may hold stale disk bytes
-            memset(bp->data, 0, ext2_info.block_size);
-        uint32 off     = pos % ext2_info.block_size;
-        uint32 todo    = MIN(end - pos, ext2_info.block_size - off);
-        vfs_either_copy_out(buf, bp->data + off, todo);
-        brelse(bp);
+        uint32 off  = pos % ext2_info.block_size;
+        uint32 todo = MIN(end - pos, ext2_info.block_size - off);
+
+        if (blkno == 0) {
+            // Sparse hole — serve zeros directly from our zero source.
+            vfs_either_copy_out(buf, (void *)(ext2_zero_block + off), todo);
+        } else {
+            struct buf *bp = bread(0, blkno);
+            vfs_either_copy_out(buf, bp->data + off, todo);
+            brelse(bp);
+        }
 
         pos += todo;
         buf  = (void *)((uint64)buf + todo);
     }
 
-    // Reads shouldn't modify the inode, but if a sparse hole forced an alloc
-    // we persist the change rather than lose it.
+    // Reads do not modify the inode (allocate=0 above prevents dirty);
+    // this is defensive in case future code paths flip the flag.
     if (dirty)
         ext2_iwrite_raw(inode->ino, &din);
     return pos - addr;
@@ -539,7 +560,8 @@ int ext2_iwrite(struct inode *inode, uint32 addr, void *__either buf, loff_t len
     while (pos < end) {
         uint32 blkno;
         int just_alloc = 0;
-        ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno, &just_alloc);
+        ret = ext2_iaddr_cached(inode, &din, &dirty, pos, &blkno,
+                                /*allocate=*/1, &just_alloc);
         if (ret < 0)
             goto out;
 
